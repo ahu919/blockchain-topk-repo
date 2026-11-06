@@ -1,5 +1,6 @@
 package main
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -242,7 +244,6 @@ func (c *ShardClient) doGet(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// GetStats 现在返回三个值：响应数据、字节数、本次请求耗时（用于新鲜性验证）
 func (c *ShardClient) GetStats() (StatsResponse, int64, time.Duration) {
 	start := time.Now()
 	b, _ := c.doGet(c.baseURL + "/stats")
@@ -335,7 +336,6 @@ func estimateCumulative(stats StatsResponse, x float64) float64 {
 	return float64(stats.Count)
 }
 
-// ===== 带耗时分解的数据收集 =====
 func collectDataGuaranteeKWithTiming(clients []*ShardClient, theta float64, start time.Time, K int, gMin float64,
 	trustedRoots []string) ([]Record, time.Duration, int, int64, int, bool, time.Duration, time.Duration, time.Duration) {
 	tryTheta := theta
@@ -351,7 +351,6 @@ func collectDataGuaranteeKWithTiming(clients []*ShardClient, theta float64, star
 			totalNetTime += time.Since(netStart)
 			totalDataBytes += b
 
-			// 存在性验证
 			existStart := time.Now()
 			existValid := true
 			for j, r := range recs {
@@ -366,7 +365,6 @@ func collectDataGuaranteeKWithTiming(clients []*ShardClient, theta float64, star
 				continue
 			}
 
-			// 完整性验证
 			integStart := time.Now()
 			if !VerifyIntegrityV2(tryTheta, integrity, len(recs), root, trustedRoots[i]) {
 				logError("   ❌ 分片 %d 完整性验证失败，已丢弃该分片\n", client.id)
@@ -395,8 +393,6 @@ func collectDataGuaranteeKWithTiming(clients []*ShardClient, theta float64, star
 }
 
 // ==================== 三种方案 ====================
-
-// baselineLocalTopK 朴素方案
 func baselineLocalTopK(clients []*ShardClient, K int, trustedRoots []string) ([]Record, time.Duration, int64, bool) {
 	start := time.Now()
 	var totalBytes int64 = 0
@@ -459,7 +455,6 @@ func baselineLocalTopK(clients []*ShardClient, K int, trustedRoots []string) ([]
 	return allRecords, dur, totalBytes, true
 }
 
-// baselineBinarySearchComplete 二分方案
 func baselineBinarySearchComplete(clients []*ShardClient, low, high float64, K int, gMin float64,
 	trustedRoots []string) (int, time.Duration, int64, []Record, int, bool) {
 	start := time.Now()
@@ -532,7 +527,6 @@ func abs(x float64) float64 {
 	return x
 }
 
-// RAQP 协议（区间阈值搜索版本）
 func runQueryWithBytes(K int, clients []*ShardClient, allStats []StatsResponse, gMin, gMax float64, totalN int,
 	fallbackResults []Record, fallbackDur time.Duration, fallbackBytes int64,
 	trustedRoots []string) ([]Record, time.Duration, int, int64, bool, time.Duration, time.Duration, time.Duration, time.Duration) {
@@ -545,9 +539,17 @@ func runQueryWithBytes(K int, clients []*ShardClient, allStats []StatsResponse, 
 	targetRank := totalN - K
 	logDebug("\n🎯 K=%d | R_target=%d\n", K, targetRank)
 
-	searchStart := time.Now() // 阈值搜索开始
+	searchStart := time.Now()
 
-	// 自适应分位数收集
+	ablationNoNarrow := os.Getenv("ABLATION_NO_NARROW_INTERVAL") == "1"
+	ablationNoDual := os.Getenv("ABLATION_NO_DUAL_BOUNDARY") == "1"
+	if ablationNoNarrow {
+		logDebug("   ⚠️ [消融 2] 跳过窄区间估计，用采样点极值作为初始区间\n")
+	}
+	if ablationNoDual {
+		logDebug("   ⚠️ [消融 3] 使用单边界搜索\n")
+	}
+
 	honestClients := []*ShardClient{}
 	honestStats := []StatsResponse{}
 	honestRoots := []string{}
@@ -594,145 +596,172 @@ func runQueryWithBytes(K int, clients []*ShardClient, allStats []StatsResponse, 
 	}
 	targetRank = actualTotalN - K
 
-	// 构建全局CDF
-	type globalPoint struct{ val, cumEst float64 }
-	var points []globalPoint
-	for _, stats := range allStats {
-		for _, q := range stats.Quantiles {
-			est := 0.0
-			for _, os := range allStats {
-				est += estimateCumulative(os, q.Val)
-			}
-			points = append(points, globalPoint{q.Val, est})
-		}
-	}
-	points = append(points, globalPoint{gMin, 0.0}, globalPoint{gMax, float64(actualTotalN)})
-	sort.Slice(points, func(i, j int) bool { return points[i].val < points[j].val })
-	unique := []globalPoint{}
-	for i, p := range points {
-		if i == 0 || p.val != points[i-1].val {
-			unique = append(unique, p)
-		} else if p.cumEst > unique[len(unique)-1].cumEst {
-			unique[len(unique)-1] = p
-		}
-	}
-	points = unique
-
-	target := float64(targetRank)
 	var theta, leftBound, rightBound, localSpan float64
-	for i := 0; i < len(points)-1; i++ {
-		if points[i].cumEst <= target && target <= points[i+1].cumEst {
-			leftBound = points[i].val
-			rightBound = points[i+1].val
-			localSpan = rightBound - leftBound
-			if points[i+1].cumEst == points[i].cumEst {
-				theta = points[i].val
-			} else {
-				ratio := (target - points[i].cumEst) / (points[i+1].cumEst - points[i].cumEst)
-				theta = points[i].val + ratio*(points[i+1].val-points[i].val)
-			}
-			break
-		}
-	}
-	logDebug("  初始区间 [%.0f, %.0f] 宽度%.0f θ=%.2f\n", leftBound, rightBound, localSpan, theta)
 
-	// 记录初始窄区间宽度，用于扩展时估算跳距
+	if ablationNoNarrow {
+		minVal := gMax
+		maxVal := gMin
+		for _, stats := range allStats {
+			for _, q := range stats.Quantiles {
+				if q.Val < minVal {
+					minVal = q.Val
+				}
+				if q.Val > maxVal {
+					maxVal = q.Val
+				}
+			}
+		}
+		leftBound = minVal
+		rightBound = maxVal
+		localSpan = rightBound - leftBound
+		theta = (leftBound + rightBound) / 2
+		logDebug("  [消融 2] 采样点极值区间 [%.0f, %.0f] 宽度%.0f\n", leftBound, rightBound, localSpan)
+	} else {
+		type globalPoint struct{ val, cumEst float64 }
+		var points []globalPoint
+		for _, stats := range allStats {
+			for _, q := range stats.Quantiles {
+				est := 0.0
+				for _, os := range allStats {
+					est += estimateCumulative(os, q.Val)
+				}
+				points = append(points, globalPoint{q.Val, est})
+			}
+		}
+		points = append(points, globalPoint{gMin, 0.0}, globalPoint{gMax, float64(actualTotalN)})
+		sort.Slice(points, func(i, j int) bool { return points[i].val < points[j].val })
+		unique := []globalPoint{}
+		for i, p := range points {
+			if i == 0 || p.val != points[i-1].val {
+				unique = append(unique, p)
+			} else if p.cumEst > unique[len(unique)-1].cumEst {
+				unique[len(unique)-1] = p
+			}
+		}
+		points = unique
+
+		target := float64(targetRank)
+		for i := 0; i < len(points)-1; i++ {
+			if points[i].cumEst <= target && target <= points[i+1].cumEst {
+				leftBound = points[i].val
+				rightBound = points[i+1].val
+				localSpan = rightBound - leftBound
+				if points[i+1].cumEst == points[i].cumEst {
+					theta = points[i].val
+				} else {
+					ratio := (target - points[i].cumEst) / (points[i+1].cumEst - points[i].cumEst)
+					theta = points[i].val + ratio*(points[i+1].val-points[i].val)
+				}
+				break
+			}
+		}
+		logDebug("  初始区间 [%.0f, %.0f] 宽度%.0f θ=%.2f\n", leftBound, rightBound, localSpan, theta)
+	}
+
 	originalSpan := localSpan
 	if originalSpan < 1 {
 		originalSpan = 1
 	}
 
-	// ============ 区间阈值搜索 ============
-	// 与点搜索不同，这里独立追踪两个边界：
-	//   thetaLow:  需要满足 C≥(thetaLow) ≥ K   (下界有效性)
-	//   thetaHigh: 需要满足 C>(thetaHigh) < K  (上界剪枝性)
-	// 当两者都满足时，收集所有 ≥ thetaLow 的记录。
-	//
-	// 关键：两个边界互不干扰。thetaLow 只管下移，thetaHigh 只管上移。
-	// 这避免了点搜索里"同一个 θ 要同时满足两个互斥条件"导致的卡死。
 	var totalRounds int
-	thetaLow := leftBound
-	thetaHigh := rightBound
-	if thetaHigh <= thetaLow {
-		thetaHigh = thetaLow + 1
-	}
-
-	jumpLow := originalSpan
-	jumpHigh := originalSpan
-	if jumpLow < 1 {
-		jumpLow = 1
-	}
-	if jumpHigh < 1 {
-		jumpHigh = 1
-	}
-
 	const intervalMaxRounds = 30
 
-	for round := 1; round <= intervalMaxRounds; round++ {
-		// 分别查询两个边界
-		cLowIncl := 0
-		cHighStrict := 0
-		for _, client := range clients {
-			c, _, b := client.CountQueryWithProof(thetaHigh)
-			cHighStrict += c
-			totalCountBytes += b
-			c2, _, b2 := client.CountInclusiveQuery(thetaLow)
-			cLowIncl += c2
-			totalCountBytes += b2
-		}
-		totalRounds++
-
-		logDebug("   轮%d low=%.2f(C≥=%d) high=%.2f(C>=%d)\n",
-			round, thetaLow, cLowIncl, thetaHigh, cHighStrict)
-
-		// 终止条件：两个条件同时满足
-		if cLowIncl >= K && cHighStrict < K {
-			logDebug("   ✅ 区间收敛 (轮次=%d)\n", totalRounds)
-			searchTime := time.Since(searchStart)
-			results, dur, _, dataB, _, ok, netT, existT, integT := collectDataGuaranteeKWithTiming(
-				clients, thetaLow, start, K, gMin, trustedRoots)
-			return results, dur, totalRounds, totalCountBytes + dataB, ok, searchTime, netT, existT, integT
+	if ablationNoDual {
+		thetaSingle := (leftBound + rightBound) / 2
+		jump := originalSpan
+		if jump < 1 {
+			jump = 1
 		}
 
-		// 独立调整 thetaHigh：C>(thetaHigh) ≥ K 说明 thetaHigh 太低，需要上移
-		if cHighStrict >= K {
-			thetaHigh += jumpHigh
-			if thetaHigh > gMax {
-				thetaHigh = gMax
+		for round := 1; round <= intervalMaxRounds; round++ {
+			cStrict := 0
+			cIncl := 0
+			for _, client := range clients {
+				c, _, b := client.CountQueryWithProof(thetaSingle)
+				cStrict += c
+				totalCountBytes += b
+				c2, _, b2 := client.CountInclusiveQuery(thetaSingle)
+				cIncl += c2
+				totalCountBytes += b2
 			}
-			jumpHigh *= 2
-			if jumpHigh > (gMax-gMin)/2 {
-				jumpHigh = (gMax - gMin) / 2
-			}
-			logDebug("   ↕ thetaHigh 上移至 %.2f\n", thetaHigh)
-		}
+			totalRounds++
+			logDebug("   [消融 3] 轮%d θ=%.2f C>=%d C>=%d\n", round, thetaSingle, cStrict, cIncl)
 
-		// 独立调整 thetaLow：C≥(thetaLow) < K 说明 thetaLow 太高，需要下移
-		if cLowIncl < K {
-			thetaLow -= jumpLow
-			if thetaLow < gMin {
-				thetaLow = gMin
+			if cStrict < K && cIncl >= K {
+				logDebug("   ✅ [消融 3] 单边界收敛 (轮次=%d)\n", totalRounds)
+				searchTime := time.Since(searchStart)
+				results, dur, _, dataB, _, ok, netT, existT, integT := collectDataGuaranteeKWithTiming(
+					clients, thetaSingle, start, K, gMin, trustedRoots)
+				return results, dur, totalRounds, totalCountBytes + dataB, ok, searchTime, netT, existT, integT
 			}
-			jumpLow *= 2
-			if jumpLow > (gMax-gMin)/2 {
-				jumpLow = (gMax - gMin) / 2
-			}
-			logDebug("   ↕ thetaLow 下移至 %.2f\n", thetaLow)
-		}
 
-		// 安全约束：保持 thetaLow < thetaHigh
-		if thetaLow >= thetaHigh {
-			thetaLow = thetaHigh - 1
-			if thetaLow < gMin {
-				thetaLow = gMin
+			if cStrict >= K {
+				thetaSingle += jump
+			} else {
+				thetaSingle -= jump
+			}
+			jump *= 2
+			if thetaSingle < gMin { thetaSingle = gMin }
+			if thetaSingle > gMax { thetaSingle = gMax }
+		}
+	} else {
+		thetaLow := leftBound
+		thetaHigh := rightBound
+		if thetaHigh <= thetaLow {
+			thetaHigh = thetaLow + 1
+		}
+		jumpLow := originalSpan
+		jumpHigh := originalSpan
+		if jumpLow < 1 { jumpLow = 1 }
+		if jumpHigh < 1 { jumpHigh = 1 }
+
+		for round := 1; round <= intervalMaxRounds; round++ {
+			cLowIncl := 0
+			cHighStrict := 0
+			for _, client := range clients {
+				c, _, b := client.CountQueryWithProof(thetaHigh)
+				cHighStrict += c
+				totalCountBytes += b
+				c2, _, b2 := client.CountInclusiveQuery(thetaLow)
+				cLowIncl += c2
+				totalCountBytes += b2
+			}
+			totalRounds++
+			logDebug("   轮%d low=%.2f(C≥=%d) high=%.2f(C>=%d)\n", round, thetaLow, cLowIncl, thetaHigh, cHighStrict)
+
+			if cLowIncl >= K && cHighStrict < K {
+				logDebug("   ✅ 区间收敛 (轮次=%d)\n", totalRounds)
+				searchTime := time.Since(searchStart)
+				results, dur, _, dataB, _, ok, netT, existT, integT := collectDataGuaranteeKWithTiming(
+					clients, thetaLow, start, K, gMin, trustedRoots)
+				return results, dur, totalRounds, totalCountBytes + dataB, ok, searchTime, netT, existT, integT
+			}
+
+			if cHighStrict >= K {
+				thetaHigh += jumpHigh
+				if thetaHigh > gMax { thetaHigh = gMax }
+				jumpHigh *= 2
+				if jumpHigh > (gMax-gMin)/2 { jumpHigh = (gMax - gMin) / 2 }
+				logDebug("   ↕ thetaHigh 上移至 %.2f\n", thetaHigh)
+			}
+
+			if cLowIncl < K {
+				thetaLow -= jumpLow
+				if thetaLow < gMin { thetaLow = gMin }
+				jumpLow *= 2
+				if jumpLow > (gMax-gMin)/2 { jumpLow = (gMax - gMin) / 2 }
+				logDebug("   ↕ thetaLow 下移至 %.2f\n", thetaLow)
+			}
+
+			if thetaLow >= thetaHigh {
+				thetaLow = thetaHigh - 1
+				if thetaLow < gMin { thetaLow = gMin }
 			}
 		}
 	}
 
-	// ===== 回退分支（区间搜索未能收敛时的安全网）=====
-	logDebug("   ⬅️ 区间搜索未收敛，回退全局二分法\n")
-	_, _, bytes, results, _, ok := baselineBinarySearchComplete(
-		clients, gMin, gMax, K, gMin, trustedRoots)
+	logDebug("   ⬅️ 未收敛，回退全局二分法\n")
+	_, _, bytes, results, _, ok := baselineBinarySearchComplete(clients, gMin, gMax, K, gMin, trustedRoots)
 	if !ok {
 		return nil, 0, -1, 0, false, 0, 0, 0, 0
 	}
@@ -741,7 +770,6 @@ func runQueryWithBytes(K int, clients []*ShardClient, allStats []StatsResponse, 
 	return results, totalDur, -1, totalCountBytes + bytes, true, searchTime, 0, 0, 0
 }
 
-// ==================== 吞吐量实验函数 ====================
 func runThroughputExperiment(
 	scheme string,
 	clients []*ShardClient,
@@ -786,11 +814,9 @@ func runThroughputExperiment(
 
 				switch scheme {
 				case "raqp":
-					_, _, _, dataBytes, ok, _, _, _, _ = runQueryWithBytes(K, clients, allStats,
-						gMin, gMax, totalN, nil, 0, 0, trustedRoots)
+					_, _, _, dataBytes, ok, _, _, _, _ = runQueryWithBytes(K, clients, allStats, gMin, gMax, totalN, nil, 0, 0, trustedRoots)
 				case "binary":
-					_, _, dataBytes, _, _, ok = baselineBinarySearchComplete(
-						clients, gMin, gMax, K, gMin, trustedRoots)
+					_, _, dataBytes, _, _, ok = baselineBinarySearchComplete(clients, gMin, gMax, K, gMin, trustedRoots)
 				case "naive":
 					_, _, dataBytes, ok = baselineLocalTopK(clients, K, trustedRoots)
 				default:
@@ -815,18 +841,13 @@ func runThroughputExperiment(
 	if completed > 0 {
 		qps = float64(completed) / elapsed
 		var sum float64
-		for _, l := range latencies {
-			sum += l
-		}
+		for _, l := range latencies { sum += l }
 		avgLatency = sum / float64(len(latencies))
 		sort.Float64s(latencies)
 		idx := int(float64(len(latencies)) * 0.99)
-		if idx >= len(latencies) {
-			idx = len(latencies) - 1
-		}
+		if idx >= len(latencies) { idx = len(latencies) - 1 }
 		p99Latency = latencies[idx]
 	}
-
 	return
 }
 
@@ -840,8 +861,7 @@ func printThroughputResults(scheme string, concurrencyLevels []int,
 	for _, c := range concurrencyLevels {
 		completed, qps, avgLat, p99Lat, _ := runThroughputExperiment(
 			scheme, clients, allStats, gMin, gMax, totalN, trustedRoots, c, 120*time.Second)
-		fmt.Printf("%-12d %-12d %-12.2f %-12.3f %-12.3f\n",
-			c, completed, qps, avgLat, p99Lat)
+		fmt.Printf("%-12d %-12d %-12.2f %-12.3f %-12.3f\n", c, completed, qps, avgLat, p99Lat)
 	}
 }
 
@@ -858,13 +878,35 @@ func main() {
 		Verbose = true
 	}
 
-	fmt.Println("🚀 RAQP 协调者 (区间阈值搜索版，完整性验证 V2)")
+	fmt.Println("🚀 RAQP 协调者 (脱敏版，兼容论文实验)")
 
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 
-	clients := []*ShardClient{
-		
+	// 【脱敏修改点】从外部文件读取分片列表，而不是硬编码 IP
+	clients := []*ShardClient{}
+	file, err := os.Open("shards.txt")
+	if err != nil {
+		fmt.Println("❌ 未找到 shards.txt 文件！请创建该文件并在每一行写入一个分片 URL，例如：")
+		fmt.Println("   http://127.0.0.1:8081")
+		fmt.Println("   http://127.0.0.1:8082")
+		os.Exit(1)
 	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	id := 1
+	for scanner.Scan() {
+		url := strings.TrimSpace(scanner.Text())
+		if url != "" && !strings.HasPrefix(url, "#") {
+			clients = append(clients, &ShardClient{
+				baseURL: url,
+				id:      id,
+				httpClient: httpClient,
+			})
+			id++
+		}
+	}
+	fmt.Printf("✅ 成功加载 %d 个分片配置\n", len(clients))
 
 	var gMin, gMax = 1e18, -1e18
 	totalN := 0
@@ -888,12 +930,8 @@ func main() {
 		allStats[i] = stats
 		trustedRoots[i] = stats.RootHash
 		heightCount[stats.Height]++
-		if stats.Min < gMin {
-			gMin = stats.Min
-		}
-		if stats.Max > gMax {
-			gMax = stats.Max
-		}
+		if stats.Min < gMin { gMin = stats.Min }
+		if stats.Max > gMax { gMax = stats.Max }
 		totalN += stats.Count
 		fmt.Printf("  Shard %d: min=%.0f max=%.0f count=%d height=%d root=%s\n",
 			client.id, stats.Min, stats.Max, stats.Count, stats.Height, stats.RootHash[:12])
@@ -921,8 +959,7 @@ func main() {
 		return
 	}
 
-	// 默认模式
-	for _, K := range []int{10, 50, 100, 200,500,1000} {
+	for _, K := range []int{10, 50, 100, 200, 500, 1000} {
 		fmt.Printf("\n===== K=%d (基于高度 %d) =====\n", K, queryHeight)
 
 		bIter, bDur, bBytes, bResults, bReturned, ok := baselineBinarySearchComplete(
@@ -958,7 +995,6 @@ func main() {
 		fmt.Printf("    数据收集 (各分片网络传输):     %v\n", netTime)
 		fmt.Printf("    存在性验证 (记录默克尔路径):   %v\n", existTime)
 		fmt.Printf("    完整性验证 (V2证明校验):       %v\n", integTime)
-		// 使用新鲜性验证平均值（而不是阶段0总耗时）
 		fmt.Printf("    新鲜性验证 (单分片平均请求):     %v\n", avgFreshnessTime)
 
 		fmt.Println("\n  --- 朴素本地 Top-K 方案 (Baseline 3) ---")
