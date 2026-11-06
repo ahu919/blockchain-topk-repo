@@ -213,8 +213,6 @@ func (mit *MIT) buildIntegrityPath(node *MITNode, theta float64, proof *Integrit
 	}
 
 	// 检查当前节点是否为“分割节点”
-	// 条件从原来的 theta >= Left.Max && theta < Right.Min
-	// 修改为：Left.Max < theta && Right.Min >= theta
 	if node.Left.Max < theta && node.Right.Min >= theta {
 		proof.LeftChild = SubTreeSummary{
 			Hash: node.Left.Hash, Min: node.Left.Min, Max: node.Left.Max,
@@ -254,7 +252,6 @@ func (mit *MIT) ProveIntegrity(theta float64) IntegrityProof {
 		return proof
 	}
 
-	
 	if mit.Root.Max < theta {
 		proof.LeftChild = SubTreeSummary{
 			Hash: mit.Root.Hash, Min: mit.Root.Min, Max: mit.Root.Max,
@@ -264,7 +261,6 @@ func (mit *MIT) ProveIntegrity(theta float64) IntegrityProof {
 		return proof
 	}
 
-	
 	if mit.Root.Min >= theta {
 		proof.RightChild = SubTreeSummary{
 			Hash: mit.Root.Hash, Min: mit.Root.Min, Max: mit.Root.Max,
@@ -308,27 +304,48 @@ func (s *ShardService) StatsHandler(w http.ResponseWriter, r *http.Request) {
 		targetRank, _ := strconv.Atoi(targetRankStr)
 		globalN, _ := strconv.Atoi(globalNStr)
 		if globalN > 0 {
+			// 计算本地目标排名（用于 MALICIOUS 注入或原逻辑）
 			localRank := int(math.Round(float64(targetRank) * float64(c) / float64(globalN)))
-			start := localRank - delta
-			if start < 0 {
-				start = 0
-			}
-			end := localRank + delta
-			if end >= c {
-				end = c - 1
+
+			var quantiles []map[string]interface{}
+
+			if os.Getenv("ABLATION_FIXED_QUANTILE") == "1" {
+				// 消融 1：固定分位数，忽略 targetRank，均匀取 11 个点（0%, 10%, ..., 100%）
+				quantiles = make([]map[string]interface{}, 0, 11)
+				for j := 0; j <= 10; j++ {
+					rank := j * (c - 1) / 10
+					rec, proof := s.mit.GetQuantile(rank)
+					quantiles = append(quantiles, map[string]interface{}{
+						"val":   rec.Val,
+						"rank":  rank,
+						"id":    rec.ID,
+						"proof": proof,
+					})
+				}
+			} else {
+				// 原逻辑：目标邻域采样
+				start := localRank - delta
+				if start < 0 {
+					start = 0
+				}
+				end := localRank + delta
+				if end >= c {
+					end = c - 1
+				}
+
+				quantiles = make([]map[string]interface{}, 0, end-start+1)
+				for rank := start; rank <= end; rank++ {
+					rec, proof := s.mit.GetQuantile(rank)
+					quantiles = append(quantiles, map[string]interface{}{
+						"val":   rec.Val,
+						"rank":  rank,
+						"id":    rec.ID,
+						"proof": proof,
+					})
+				}
 			}
 
-			quantiles := make([]map[string]interface{}, 0, end-start+1)
-			for rank := start; rank <= end; rank++ {
-				rec, proof := s.mit.GetQuantile(rank)
-				quantiles = append(quantiles, map[string]interface{}{
-					"val":   rec.Val,
-					"rank":  rank,
-					"id":    rec.ID,
-					"proof": proof,
-				})
-			}
-
+			// MALICIOUS 注入（保留原有逻辑，仅针对 localRank 点）
 			if os.Getenv("MALICIOUS") == "1" {
 				for i := range quantiles {
 					if rk, ok := quantiles[i]["rank"].(int); ok && rk == localRank {
@@ -444,15 +461,15 @@ func loadRecordsFromContract(contractAddr string, rpcURL string) ([]Record, erro
 func main() {
 	contractAddr := os.Getenv("CONTRACT_ADDR")
 	if contractAddr == "" {
-		contractAddr = ""
+		contractAddr = "0xYOUR_TEST_CONTRACT"
 	}
 	rpcURL := os.Getenv("RPC_URL")
 	if rpcURL == "" {
-		rpcURL = ""
+		rpcURL = "./geth.ipc"
 	}
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = ""
+		port = ":8081"
 	}
 
 	records, err := loadRecordsFromContract(contractAddr, rpcURL)
