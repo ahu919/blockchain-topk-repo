@@ -1,5 +1,5 @@
-RAQP-VMIT: Verifiable Cross-Shard Top-K Query in Blockchain Databases
-This repository provides the official open-source code and experimental artifacts for the paper "RAQP-VMIT: Verifiable Cross-Shard Top-K Query in Blockchain Databases". The project implements a sharded blockchain environment based on the Geth client, featuring the Query-Aware Adaptive Threshold Search (RAQP) algorithm and the Verifiable Merkle Interval Tree (VMIT).
+Verifiable Cross-Shard Top-K Query in Blockchain Databases
+This repository provides the official open-source code and experimental artifacts for the paper "Verifiable Top-K Queries in Cross-Shard Blockchain Databases". The project implements a sharded blockchain environment based on the Geth client, featuring the Query-Aware Adaptive Threshold Search (RAQP) algorithm and the Verifiable Merkle Interval Tree (VMIT).
 
 1. Directory Structure
 chain/: Contains genesis.json (Clique PoA genesis configuration, ChainID: 4321).
